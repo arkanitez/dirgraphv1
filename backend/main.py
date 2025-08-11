@@ -1,4 +1,4 @@
-import asyncio, uuid, traceback
+import asyncio, uuid, traceback, logging
 from pathlib import Path
 from typing import Dict, List
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException
@@ -6,8 +6,14 @@ from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 
 from .models import EnumerateRequest
-from .wordlists import ensure_seclists, index_wordlists, choose_wordlists, iter_candidates
+from .wordlists import (
+    ensure_seclists, index_wordlists, choose_wordlists, iter_candidates, builtin_candidates
+)
 from .scanner import DirEnumerator, initial_probe, soft_404_baseline
+
+# Basic logging
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+log = logging.getLogger("dirgraph.main")
 
 APP_DIR = Path(__file__).resolve().parent
 ROOT = APP_DIR.parent
@@ -58,17 +64,36 @@ async def start_enumeration(req: EnumerateRequest):
     q: asyncio.Queue = asyncio.Queue()
     JOBS[job_id] = {"queue": q}
 
-    async def emit(ev): await q.put(ev)
+    async def emit(ev): 
+        # also mirror to server logs for visibility
+        if ev.get("type") == "stage":
+            log.info("Stage: %s %s", ev.get("stage"), {k:v for k,v in ev.items() if k not in ("type","stage")})
+        elif ev.get("type") == "meta":
+            log.info("Meta: total_candidates=%s exts=%s", ev.get("total_candidates"), ev.get("exts"))
+        elif ev.get("type") == "progress":
+            pass
+        elif ev.get("type") == "found":
+            item = ev.get("item", {})
+            log.info("Found: %s %s", item.get("status"), item.get("path"))
+        elif ev.get("type") == "error":
+            log.error("Error event: %s", ev.get("message"))
+        await q.put(ev)
 
     async def run():
         try:
-            await ensure_seclists(on_event=emit)
+            # 1) Ensure SecLists (streamed progress)
+            try:
+                await ensure_seclists(on_event=emit)
+            except Exception as dl_e:
+                await emit({"type":"stage","stage":"seclists_error","message": str(dl_e)})
+                log.warning("SecLists unavailable, will use builtin fallback: %s", dl_e)
 
             await emit({"type":"stage","stage":"indexing_lists"})
             catalog = await asyncio.to_thread(index_wordlists)
             counts = {k: len(v) for k, v in catalog.items()}
             await emit({"type":"stage","stage":"indexing_lists_done","counts": counts})
 
+            # 2) Probe target and choose lists
             await emit({"type":"stage","stage":"probing_target"})
             import aiohttp
             async with aiohttp.ClientSession() as session:
@@ -79,6 +104,12 @@ async def start_enumeration(req: EnumerateRequest):
 
                 await emit({"type":"stage","stage":"building_candidates"})
                 candidates = await asyncio.to_thread(iter_candidates, chosen, req.max_paths)
+
+                # Fallback if nothing to do
+                if not candidates:
+                    await emit({"type":"stage","stage":"using_builtin_wordlist"})
+                    candidates = builtin_candidates(min(req.max_paths, 5000))
+
                 await emit({"type":"stage","stage":"candidates_ready","count": len(candidates)})
 
                 hdr_low = {k.lower(): v.lower() for k, v in headers.items()}
@@ -88,12 +119,22 @@ async def start_enumeration(req: EnumerateRequest):
                 elif "php" in hdr_low.get("x-powered-by","") or "php" in (html or "").lower():
                     exts = [".php"]
 
-                await emit({"type":"meta","wordlists":[str(p) for _,p in chosen], "total_candidates": len(candidates), "exts": exts})
+                await emit({
+                    "type":"meta",
+                    "wordlists": [str(p) for _, p in chosen] if chosen else ["builtin (embedded)"],
+                    "total_candidates": len(candidates),
+                    "exts": exts
+                })
+
                 await emit({"type":"stage","stage":"soft_404_baseline"})
                 baseline = await soft_404_baseline(session, str(req.url))
 
-            enumerator = DirEnumerator(str(req.url), follow_redirects=req.follow_redirects,
-                                       max_concurrency=req.max_concurrency, timeout=req.timeout_seconds)
+            # 3) Enumerate
+            enumerator = DirEnumerator(str(req.url),
+                follow_redirects=req.follow_redirects,
+                max_concurrency=req.max_concurrency,
+                timeout=req.timeout_seconds
+            )
             enumerator.exts_hint = exts
             await emit({"type":"stage","stage":"enumeration_started"})
             found_items = await enumerator.run(candidates, emit, baseline)
@@ -101,12 +142,12 @@ async def start_enumeration(req: EnumerateRequest):
             filtered = [f.model_dump() for f in found_items if int(f.status) in (200, 204, 301, 302, 401, 403)]
             graph = _to_graph(str(req.url), filtered)
             await emit({"type":"done","result": graph})
+            log.info("Enumeration done: tested=%d, kept=%d", len(found_items), len(filtered))
 
         except asyncio.CancelledError:
             try: await emit({"type":"canceled"})
             finally: pass
         except Exception:
-            # Emit full traceback to the client for visibility
             await emit({"type":"error","message": traceback.format_exc()})
         finally:
             await q.put(None)
