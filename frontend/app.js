@@ -1,5 +1,10 @@
-/* global cytoscape, coseBilkent */
-cytoscape.use(coseBilkent);
+/* global cytoscape */
+const bilkent = window.cytoscapeCoseBilkent || window.coseBilkent;
+if (bilkent) {
+  cytoscape.use(bilkent);
+} else {
+  console.warn('cose-bilkent plugin not found; falling back to breadthfirst');
+}
 
 const urlEl = document.querySelector('#url');
 const goBtn = document.querySelector('#go');
@@ -43,7 +48,7 @@ function initCy(){
       { selector: 'edge',
         style: { 'width': 2, 'line-color': '#cbd5e1', 'target-arrow-color':'#cbd5e1', 'target-arrow-shape':'triangle' } }
     ],
-    layout: { name: 'cose-bilkent', animate: false }
+    layout: { name: (window.cytoscapeCoseBilkent || window.coseBilkent) ? 'cose-bilkent' : 'breadthfirst', animate: false }
   });
 
   cy.on('tap', 'node', (e)=>{
