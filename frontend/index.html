@@ -1,0 +1,41 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8"/>
+  <title>DirGraph</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1"/>
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@shoelace-style/shoelace@2.16.0/cdn/themes/light.css">
+  <script type="module" src="https://cdn.jsdelivr.net/npm/@shoelace-style/shoelace@2.16.0/cdn/shoelace.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/cytoscape@3.28.1/dist/cytoscape.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/cytoscape-cose-bilkent@4.1.0/cytoscape-cose-bilkent.js"></script>
+  <style>
+    body { font-family: ui-sans-serif,system-ui,Segoe UI,Roboto,Helvetica,Arial; margin:0; display:grid; grid-template-rows:auto 6px 1fr; height:100vh; }
+    header { padding: 12px 16px; display:flex; gap:8px; align-items:center; border-bottom:1px solid #eee; }
+    #cy { width: 100%; height: 100%; }
+    .panel { position:absolute; right:16px; top:72px; width:360px; max-height:70vh; overflow:auto; background:#fff; border:1px solid #eee; border-radius:12px; box-shadow: 0 10px 30px rgba(0,0,0,.08); padding:12px; }
+    .muted { color:#666; font-size:12px; }
+    #progressWrap { height:6px; background:#f1f3f5; }
+    #bar { height:6px; width:0%; background:#4f46e5; transition: width .15s ease; }
+    .row { display:flex; gap:8px; align-items:center; }
+    sl-input::part(base){ min-width:380px; }
+    code { background:#f6f8fa; padding:2px 6px; border-radius:6px; }
+  </style>
+</head>
+<body>
+  <header>
+    <strong>DirGraph</strong>
+    <sl-input id="url" placeholder="https://example.com/" size="small" clearable></sl-input>
+    <sl-button id="go" variant="primary" size="small">Enumerate</sl-button>
+    <span id="meta" class="muted"></span>
+  </header>
+  <div id="progressWrap"><div id="bar"></div></div>
+  <div style="position:relative;">
+    <div id="cy"></div>
+    <div class="panel" id="details" hidden>
+      <div class="row"><strong>Details</strong><sl-button size="small" variant="text" id="closePanel">close</sl-button></div>
+      <div id="info"></div>
+    </div>
+  </div>
+  <script type="module" src="/static/app.js"></script>
+</body>
+</html>
