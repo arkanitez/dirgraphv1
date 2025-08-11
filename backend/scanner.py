@@ -8,10 +8,12 @@ from . import analyzer
 
 EventCb = Callable[[Dict], None]
 
+
 def _rand_token(n=24):
     return "".join(random.choice(string.ascii_lowercase) for _ in range(n))
 
-async def initial_probe(session: aiohttp.ClientSession, base: str) -> Tuple[str, Dict[str,str]]:
+
+async def initial_probe(session: aiohttp.ClientSession, base: str) -> Tuple[str, Dict[str, str]]:
     try:
         async with session.get(base, allow_redirects=True) as r:
             text = await r.text(errors="ignore")
@@ -19,6 +21,7 @@ async def initial_probe(session: aiohttp.ClientSession, base: str) -> Tuple[str,
             return text, headers
     except Exception:
         return "", {}
+
 
 async def soft_404_baseline(session: aiohttp.ClientSession, base: str) -> Tuple[int, int]:
     bogus = urljoin(base, f"/{_rand_token(18)}/")
@@ -29,16 +32,30 @@ async def soft_404_baseline(session: aiohttp.ClientSession, base: str) -> Tuple[
     except Exception:
         return 404, 0
 
+
 class DirEnumerator:
-    def __init__(self, base: str, follow_redirects=False, max_concurrency=64, timeout=10,
-                 exts_hint: Optional[List[str]]=None):
-        self.base = base.rstrip("/")
+    def __init__(
+        self,
+        base: str,
+        follow_redirects: bool = False,
+        max_concurrency: int = 64,
+        timeout: int = 10,
+        exts_hint: Optional[List[str]] = None,
+    ):
+        self.base = str(base).rstrip("/")
         self.follow_redirects = follow_redirects
         self.sem = asyncio.Semaphore(max_concurrency)
         self.timeout = aiohttp.ClientTimeout(total=timeout)
         self.exts_hint = exts_hint or []
 
-    async def _check_one(self, session: aiohttp.ClientSession, path: str) -> Tuple[str, Optional[FoundItem], Optional[str]]:
+    async def _check_one(
+        self, session: aiohttp.ClientSession, path: str
+    ) -> Tuple[str, Optional[FoundItem], Optional[str]]:
+        # Harden against bytes paths to avoid: "TypeError: Cannot mix str and non-str arguments"
+        if isinstance(path, (bytes, bytearray)):
+            path = path.decode("utf-8", "ignore")
+        path = str(path)
+
         url = urljoin(self.base + "/", path.lstrip("/"))
         try:
             async with self.sem:
@@ -46,9 +63,11 @@ class DirEnumerator:
                     body = await r.read()
                     loc = r.headers.get("Location")
                     item = FoundItem(
-                        url=url, path=path, status=r.status,
+                        url=url,
+                        path=path,
+                        status=r.status,
                         size=len(body) if body else None,
-                        redirected_to=loc
+                        redirected_to=loc,
                     )
                     snippet = (body[:2048] or b"").decode(errors="ignore")
                     issues = analyzer.analyze_item(path, r.status, snippet)
@@ -57,33 +76,53 @@ class DirEnumerator:
         except Exception:
             return path, None, None
 
-    async def run(self, candidates: List[str], on_event: EventCb, baseline: Tuple[int,int]) -> List[FoundItem]:
+    async def run(
+        self,
+        candidates: List[str],
+        on_event: EventCb,
+        baseline: Tuple[int, int],
+    ) -> List[FoundItem]:
         found: List[FoundItem] = []
         tasks = []
-        total = len(candidates)
-        done = 0
+
+        # Build task list (include extension variants)
+        for path in candidates:
+            plist = [path]
+            for ext in self.exts_hint:
+                if not path.endswith(ext):
+                    plist.append(path.rstrip("/") + ext)
+            for p in plist:
+                tasks.append(asyncio.create_task(self._check_one(session=None, path=p)))
+
+        # Re-create session once to avoid per-request overhead
         async with aiohttp.ClientSession(timeout=self.timeout) as session:
-            for path in candidates:
-                plist = [path]
-                for ext in self.exts_hint:
-                    if not path.endswith(ext):
-                        plist.append(path.rstrip("/") + ext)
-                for p in plist:
-                    tasks.append(asyncio.create_task(self._check_one(session, p)))
+            # Rebind tasks with the active session
+            tasks = [asyncio.create_task(self._check_one(session, t.get_coro().cr_frame.f_locals["path"])) for t in tasks]  # type: ignore
+
+            total = len(tasks) or 1
+            done_count = 0
 
             for fut in asyncio.as_completed(tasks):
-                _, item, snippet = await fut
-                done += 1
+                _, item, _ = await fut
+                done_count += 1
+
                 if item:
                     bl_status, bl_size = baseline
-                    if bl_status == 200 and item.status == 200 and item.size is not None and bl_size:
-                        if abs(item.size - bl_size) <= max(250, int(0.15 * bl_size)):
-                            pass
-                        else:
-                            found.append(item)
+                    if (
+                        bl_status == 200
+                        and item.status == 200
+                        and item.size is not None
+                        and bl_size
+                        and abs(item.size - bl_size) <= max(250, int(0.15 * bl_size))
+                    ):
+                        # Probable soft-404; skip adding
+                        pass
                     else:
                         found.append(item)
+
                     if item.status in (200, 204, 301, 302, 401, 403):
-                        on_event({"type":"found","item":item.model_dump()})
-                on_event({"type":"progress","value": done/total})
+                        await on_event({"type": "found", "item": item.model_dump()})
+
+                await on_event({"type": "progress", "value": done_count / total})
+
         return found
