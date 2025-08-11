@@ -118,17 +118,26 @@ def choose_wordlists(url: str, html: str, headers: Dict[str, str], catalog: Dict
 
 def iter_candidates(paths: List[Tuple[str, Path]], cap: int) -> List[str]:
     yielded = 0
-    dedupe = set()
+    dedupe: set[str] = set()
     for _, p in paths:
         try:
-            with p.open("r", errors="ignore") as f:
+            # make sure we read TEXT, not binary
+            with p.open("r", encoding="utf-8", errors="ignore") as f:
                 for line in f:
-                    if yielded >= cap: return list(dedupe)
+                    if yielded >= cap:
+                        return list(dedupe)
                     s = line.strip()
-                    if not s or s.startswith("#"): continue
-                    if not s.startswith("/"): s = "/" + s
+                    # if something still sneaks in as bytes, coerce to str
+                    if isinstance(s, (bytes, bytearray)):
+                        s = s.decode("utf-8", "ignore").strip()
+                    if not s or s.startswith("#"):
+                        continue
+                    if not s.startswith("/"):
+                        s = "/" + s
                     if s not in dedupe:
-                        dedupe.add(s); yielded += 1
+                        dedupe.add(s)
+                        yielded += 1
         except Exception:
             continue
     return list(dedupe)
+
