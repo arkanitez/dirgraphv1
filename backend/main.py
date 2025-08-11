@@ -4,6 +4,7 @@ from typing import Dict, List
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
+from fastapi import HTTPException
 
 from .models import EnumerateRequest
 from .wordlists import ensure_seclists, index_wordlists, choose_wordlists, iter_candidates
@@ -99,6 +100,22 @@ async def start_enumeration(req: EnumerateRequest):
 
     JOBS[job_id]["task"] = asyncio.create_task(run())
     return {"job_id": job_id}
+
+@app.delete("/api/enumerate/{job_id}")
+async def cancel(job_id: str):
+    job = JOBS.get(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="unknown job")
+    task = job.get("task")
+    if task:
+        task.cancel()
+    # notify the websocket loop and close it
+    try:
+        await job["queue"].put({"type":"canceled"})
+        await job["queue"].put(None)
+    except Exception:
+        pass
+    return {"status":"canceled"}
 
 @app.websocket("/ws/{job_id}")
 async def ws_progress(ws: WebSocket, job_id: str):
