@@ -1,10 +1,9 @@
 import asyncio, json, uuid
 from pathlib import Path
 from typing import Dict, List
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
-from fastapi import HTTPException
 
 from .models import EnumerateRequest
 from .wordlists import ensure_seclists, index_wordlists, choose_wordlists, iter_candidates
@@ -15,8 +14,6 @@ ROOT = APP_DIR.parent
 FRONTEND = ROOT / "frontend"
 
 app = FastAPI(title="DirGraph")
-
-# Serve static assets under /static and index at /
 app.mount("/static", StaticFiles(directory=str(FRONTEND), html=False), name="static")
 
 @app.get("/")
@@ -28,14 +25,11 @@ JOBS: Dict[str, Dict] = {}
 def _to_graph(base_url: str, items: List[dict]):
     nodes = [{"data":{"id":"root","label":base_url, "status":200}}]
     edges = []
-
+    seen = {"root"}
     def node_id_for(path: str) -> str:
         return ("root" if path in ("", "/") else path.rstrip("/")) or "root"
-
-    seen = {"root"}
     for it in items:
-        path = it["path"]
-        np = node_id_for(path)
+        path = it["path"]; np = node_id_for(path)
         if np not in seen:
             nodes.append({"data":{"id": np, "label": path, "status": it["status"], "url": it["url"], "issues":"; ".join(it.get("issues") or [])}})
             seen.add(np)
@@ -45,8 +39,7 @@ def _to_graph(base_url: str, items: List[dict]):
                 parent_path = "/" + "/".join(path.strip("/").split("/")[:-1])
                 parent = node_id_for(parent_path)
                 if parent not in seen:
-                    nodes.append({"data":{"id": parent, "label": parent_path}})
-                    seen.add(parent)
+                    nodes.append({"data":{"id": parent, "label": parent_path}}); seen.add(parent)
         edges.append({"data":{"id": f"{parent}->{np}", "source": parent, "target": np}})
     summary = {
         "total_tested": len(items),
@@ -63,8 +56,12 @@ async def start_enumeration(req: EnumerateRequest):
     q: asyncio.Queue = asyncio.Queue()
     JOBS[job_id] = {"queue": q}
 
+    async def emit(ev): await q.put(ev)
+
     async def run():
-        await ensure_seclists()
+        # SecLists (streamed progress)
+        await ensure_seclists(on_event=emit)
+        await emit({"type":"stage","stage":"indexing_lists"})
         catalog = index_wordlists()
 
         enumerator = DirEnumerator(
@@ -72,12 +69,15 @@ async def start_enumeration(req: EnumerateRequest):
             max_concurrency=req.max_concurrency, timeout=req.timeout_seconds
         )
 
-        async def emit(ev): await q.put(ev)
-
+        await emit({"type":"stage","stage":"probing_target"})
         import aiohttp
         async with aiohttp.ClientSession() as session:
             html, headers = await initial_probe(session, req.url)
+
+            await emit({"type":"stage","stage":"choosing_wordlists"})
             chosen = choose_wordlists(req.url, html, headers, catalog)
+
+            await emit({"type":"stage","stage":"building_candidates"})
             candidates = iter_candidates(chosen, req.max_paths)
 
             hdr_low = {k.lower(): v.lower() for k,v in headers.items()}
@@ -88,9 +88,11 @@ async def start_enumeration(req: EnumerateRequest):
                 exts = [".php"]
 
             await emit({"type":"meta","wordlists":[str(p) for _,p in chosen], "total_candidates": len(candidates), "exts": exts})
+            await emit({"type":"stage","stage":"soft_404_baseline"})
             baseline = await soft_404_baseline(session, req.url)
 
         enumerator.exts_hint = exts
+        await emit({"type":"stage","stage":"enumeration_started"})
         found_items = await enumerator.run(candidates, emit, baseline)
 
         filtered = [f.model_dump() for f in found_items if f.status in (200, 204, 301, 302, 401, 403)]
@@ -101,38 +103,33 @@ async def start_enumeration(req: EnumerateRequest):
     JOBS[job_id]["task"] = asyncio.create_task(run())
     return {"job_id": job_id}
 
+@app.websocket("/ws/{job_id}")
+async def ws_progress(ws: WebSocket, job_id: str):
+    await ws.accept()
+    if job_id not in JOBS:
+        await ws.send_json({"type":"error","message":"unknown job"})
+        await ws.close(); return
+    q: asyncio.Queue = JOBS[job_id]["queue"]
+    try:
+        while True:
+            ev = await q.get()
+            if ev is None: break
+            await ws.send_json(ev)
+    except WebSocketDisconnect:
+        pass
+    finally:
+        await ws.close()
+        JOBS.pop(job_id, None)
+
 @app.delete("/api/enumerate/{job_id}")
 async def cancel(job_id: str):
     job = JOBS.get(job_id)
-    if not job:
-        raise HTTPException(status_code=404, detail="unknown job")
+    if not job: raise HTTPException(status_code=404, detail="unknown job")
     task = job.get("task")
-    if task:
-        task.cancel()
-    # notify the websocket loop and close it
+    if task: task.cancel()
     try:
         await job["queue"].put({"type":"canceled"})
         await job["queue"].put(None)
     except Exception:
         pass
     return {"status":"canceled"}
-
-@app.websocket("/ws/{job_id}")
-async def ws_progress(ws: WebSocket, job_id: str):
-    await ws.accept()
-    if job_id not in JOBS:
-        await ws.send_json({"type":"error","message":"unknown job"})
-        await ws.close()
-        return
-    q: asyncio.Queue = JOBS[job_id]["queue"]
-    try:
-        while True:
-            ev = await q.get()
-            if ev is None:
-                break
-            await ws.send_json(ev)
-    except Exception:
-        pass
-    finally:
-        await ws.close()
-        JOBS.pop(job_id, None)
