@@ -1,54 +1,36 @@
-/* global cytoscape */
+/* global cytoscape, coseBilkent */
 const bilkent = window.cytoscapeCoseBilkent || window.coseBilkent;
-if (bilkent) {
-  cytoscape.use(bilkent);
-} else {
-  console.warn('cose-bilkent plugin not found; falling back to breadthfirst');
-}
+if (bilkent) { cytoscape.use(bilkent); } else { console.warn('cose-bilkent not found; using breadthfirst'); }
 
 const urlEl = document.querySelector('#url');
 const goBtn = document.querySelector('#go');
+const cancelBtn = document.querySelector('#cancel');
 const bar = document.querySelector('#bar');
 const meta = document.querySelector('#meta');
 const details = document.querySelector('#details');
 const info = document.querySelector('#info');
 document.querySelector('#closePanel').addEventListener('click', ()=> details.hidden = true);
 
-let cy;
+let cy, ws = null, running = false, jobId = null;
+let stats = { total: 0, done: 0, found: 0, ok200:0, forb403:0, auth401:0, redir30x:0 };
+let t0 = 0;
 
 function initCy(){
   const container = document.getElementById('cy');
-  if (!container) throw new Error('#cy not found');
   cy = cytoscape({
-    container,
-    elements: [],
-    minZoom: 0.2,
-    maxZoom: 2.5,
+    container, elements: [], minZoom: 0.2, maxZoom: 2.5,
     style: [
-      { selector: 'node',
-        style: {
-          'background-color': '#94a3b8',
-          'label': 'data(label)',
-          'text-valign': 'center',
-          'color': '#1f2937',
-          'text-background-color': '#ffffff',
-          'text-background-opacity': 1,
-          'text-background-padding': 3,
-          'border-width': 2,
-          'border-color': '#e5e7eb',
-          'font-size': 10
-        }
-      },
-      { selector: 'node[status >= 400]',
-        style: {'background-color': '#ef4444', 'border-color':'#fecaca'} },
-      { selector: 'node[status >= 300][status < 400]',
-        style: {'background-color': '#f59e0b', 'border-color':'#fde68a'} },
-      { selector: 'node[status >= 200][status < 300]',
-        style: {'background-color': '#22c55e', 'border-color':'#bbf7d0'} },
-      { selector: 'edge',
-        style: { 'width': 2, 'line-color': '#cbd5e1', 'target-arrow-color':'#cbd5e1', 'target-arrow-shape':'triangle' } }
+      { selector: 'node', style: {
+        'background-color': '#94a3b8','label': 'data(label)','text-valign': 'center','color': '#1f2937',
+        'text-background-color': '#ffffff','text-background-opacity': 1,'text-background-padding': 3,
+        'border-width': 2,'border-color': '#e5e7eb','font-size': 10
+      }},
+      { selector: 'node[status >= 400]', style: {'background-color': '#ef4444','border-color':'#fecaca'} },
+      { selector: 'node[status >= 300][status < 400]', style: {'background-color': '#f59e0b','border-color':'#fde68a'} },
+      { selector: 'node[status >= 200][status < 300]', style: {'background-color': '#22c55e','border-color':'#bbf7d0'} },
+      { selector: 'edge', style: { 'width': 2,'line-color': '#cbd5e1','target-arrow-color':'#cbd5e1','target-arrow-shape':'triangle' } }
     ],
-    layout: { name: (window.cytoscapeCoseBilkent || window.coseBilkent) ? 'cose-bilkent' : 'breadthfirst', animate: false }
+    layout: { name: (bilkent ? 'cose-bilkent' : 'breadthfirst'), animate: false }
   });
 
   cy.on('tap', 'node', (e)=>{
@@ -67,37 +49,102 @@ initCy();
 function setProgress(p){ bar.style.width = `${Math.max(0, Math.min(100, Math.round(p*100)))}%`; }
 function showProgress(on){ document.getElementById('progressWrap').style.visibility = on ? 'visible' : 'hidden'; }
 
+function setRunning(on){
+  running = on;
+  // Shoelace sl-button supports a 'loading' property
+  goBtn.loading = on;
+  goBtn.disabled = on;
+  urlEl.disabled = on;
+  cancelBtn.hidden = !on;
+  if (on) {
+    document.title = '⏳ DirGraph';
+    showProgress(true);
+  } else {
+    document.title = 'DirGraph';
+  }
+}
+
+function renderMeta(wordlists){
+  const elapsed = running ? ((Date.now() - t0)/1000) : 0;
+  const rate = elapsed ? (stats.done/elapsed).toFixed(1) : '0.0';
+  const eta = (stats.total && stats.done ? Math.max(0, (stats.total - stats.done)/(stats.done/Math.max(elapsed,0.001))) : 0);
+  const etaStr = isFinite(eta) ? `${eta.toFixed(0)}s` : '—';
+  const wl = wordlists ? `lists: ${wordlists.map(x=>x.split('/').slice(-2).join('/')).join(', ')}` : '';
+  meta.textContent =
+    `${wl}${wl ? ' | ' : ''}candidates: ${stats.total} | done: ${stats.done} | found: ${stats.found} ` +
+    `(200:${stats.ok200} 403:${stats.forb403} 401:${stats.auth401} 30x:${stats.redir30x}) | ` +
+    `rate: ${rate}/s | elapsed: ${elapsed.toFixed(0)}s | ETA: ${etaStr}`;
+}
+
 async function enumerate(){
   const target = urlEl.value.trim();
-  if (!target) return;
-  setProgress(0); showProgress(true); meta.textContent = '';
-  cy.elements().remove();
+  if (!target || running) return;
+
+  // reset
+  stats = { total: 0, done: 0, found: 0, ok200:0, forb403:0, auth401:0, redir30x:0 };
+  setProgress(0); showProgress(true); meta.textContent = ''; cy.elements().remove();
+  setRunning(true); t0 = Date.now();
 
   const resp = await fetch('/api/enumerate', {
     method: 'POST', headers:{'Content-Type':'application/json'},
     body: JSON.stringify({ url: target })
   });
   const { job_id } = await resp.json();
+  jobId = job_id;
 
-  const ws = new WebSocket(`${location.protocol === 'https:' ? 'wss' : 'ws'}://${location.host}/ws/${job_id}`);
+  ws = new WebSocket(`${location.protocol === 'https:' ? 'wss' : 'ws'}://${location.host}/ws/${job_id}`);
 
   ws.onmessage = (ev)=>{
     const msg = JSON.parse(ev.data);
-    if (msg.type === 'progress'){
+    if (msg.type === 'meta'){
+      stats.total = msg.total_candidates || 0;
+      renderMeta(msg.wordlists || []);
+    } else if (msg.type === 'progress'){
+      // done is approximate from fraction if total unknown yet
+      if (stats.total) stats.done = Math.min(stats.total, Math.round(msg.value * stats.total));
       setProgress(msg.value);
-    } else if (msg.type === 'meta'){
-      meta.textContent = `lists: ${msg.wordlists.map(x=>x.split('/').slice(-2).join('/')).join(', ')} | candidates: ${msg.total_candidates}`;
+      renderMeta();
+    } else if (msg.type === 'found'){
+      stats.found++;
+      const s = msg.item?.status;
+      if (s >= 200 && s < 300) stats.ok200++;
+      else if (s === 403) stats.forb403++;
+      else if (s === 401) stats.auth401++;
+      else if (String(s).startsWith('30')) stats.redir30x++;
+      renderMeta();
     } else if (msg.type === 'done'){
       const g = msg.result;
       cy.add(g.nodes);
       cy.add(g.edges);
-      cy.layout({ name: 'cose-bilkent', animate:false }).run();
+      cy.layout({ name: (bilkent ? 'cose-bilkent' : 'breadthfirst'), animate:false }).run();
       setProgress(1);
-      setTimeout(()=> showProgress(false), 400);
-      ws.close();
+      renderMeta();
+      finishRun();
+    } else if (msg.type === 'canceled'){
+      meta.textContent = 'Canceled.';
+      finishRun();
+    } else if (msg.type === 'error'){
+      meta.textContent = `Error: ${msg.message || 'unknown'}`;
+      finishRun();
     }
   };
+
+  ws.onerror = ()=> { meta.textContent = 'WebSocket error.'; finishRun(); };
+  ws.onclose = ()=> { if (running) finishRun(); };
+}
+
+function finishRun(){
+  setRunning(false);
+  setTimeout(()=> showProgress(false), 400);
+  if (ws) { try { ws.close(); } catch(_){} ws = null; }
+  jobId = null;
 }
 
 goBtn.addEventListener('click', enumerate);
 urlEl.addEventListener('keydown', (e)=> { if (e.key === 'Enter') enumerate(); });
+
+cancelBtn.addEventListener('click', async ()=>{
+  if (!jobId) return;
+  try { await fetch(`/api/enumerate/${jobId}`, { method: 'DELETE' }); } catch(_) {}
+  finishRun();
+});
