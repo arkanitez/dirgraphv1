@@ -1,8 +1,12 @@
-import asyncio, zipfile, io, os
+import asyncio, zipfile
 from pathlib import Path
 from typing import Dict, List, Tuple, Optional, Callable, Any
 import aiohttp
+import logging
 
+log = logging.getLogger("dirgraph.wordlists")
+
+# Pinned SecLists commit
 SECLISTS_COMMIT = "617ecd9393ecd12925bde2467201c51e6baa7cdb"
 
 BASE = Path(__file__).resolve().parent.parent
@@ -10,6 +14,7 @@ DATA = BASE / "data"
 SECLISTS_DIR = DATA / "SecLists"
 WEB_CONTENT_DIR = SECLISTS_DIR / "Discovery" / "Web-Content"
 
+# First-run subset (expand if you want more)
 WANTED_PATTERNS = [
     "directory-list-2.3-*.txt",
     "raft-*-directories.txt",
@@ -17,13 +22,31 @@ WANTED_PATTERNS = [
     "SVNDigger/cat/*/*.txt",
 ]
 
+# Minimal built-in fallback list (used only if SecLists missing/unavailable)
+BUILTIN_CANDIDATES = [
+    "/admin", "/login", "/administrator", "/wp-admin", "/wp-login.php",
+    "/robots.txt", "/sitemap.xml", "/server-status", "/.git/", "/.env",
+    "/config.php", "/backup", "/backups", "/phpinfo.php", "/.svn/",
+    "/.hg/", "/.DS_Store", "/.well-known/security.txt", "/api", "/health"
+]
+
 EventCb = Callable[[Dict[str, Any]], None]
 
+def _txt_count() -> int:
+    return sum(1 for _ in WEB_CONTENT_DIR.rglob("*.txt")) if WEB_CONTENT_DIR.exists() else 0
+
 async def ensure_seclists(on_event: Optional[EventCb] = None):
-    if WEB_CONTENT_DIR.exists():
+    """
+    Ensure the SecLists Web-Content subtree exists locally.
+    On first run, download the repo zip and extract only Web-Content.
+    If extraction yields no .txt files, raise an error so the caller can fallback or report.
+    """
+    if WEB_CONTENT_DIR.exists() and _txt_count() > 0:
         if on_event: await on_event({"type":"stage","stage":"seclists_cached"})
+        log.info("SecLists already present: %s files", _txt_count())
         return
 
+    # Fresh download
     SECLISTS_DIR.mkdir(parents=True, exist_ok=True)
     DATA.mkdir(parents=True, exist_ok=True)
     tmp_zip = DATA / "seclists.repo.zip.part"
@@ -38,11 +61,14 @@ async def ensure_seclists(on_event: Optional[EventCb] = None):
             downloaded = 0
             with tmp_zip.open("wb") as f:
                 async for chunk in resp.content.iter_chunked(1<<20):
-                    f.write(chunk); downloaded += len(chunk)
+                    f.write(chunk)
+                    downloaded += len(chunk)
                     if on_event and total:
-                        await on_event({"type":"stage","stage":"seclists_downloading","downloaded":downloaded,"total":total})
+                        await on_event({"type":"stage","stage":"seclists_downloading",
+                                        "downloaded": downloaded, "total": total})
 
     if on_event: await on_event({"type":"stage","stage":"seclists_extract_start"})
+    extracted = 0
     with zipfile.ZipFile(tmp_zip, "r") as z:
         prefix = f"SecLists-{SECLISTS_COMMIT}/Discovery/Web-Content/"
         members = [m for m in z.infolist() if m.filename.startswith(prefix)]
@@ -56,13 +82,24 @@ async def ensure_seclists(on_event: Optional[EventCb] = None):
                 target.parent.mkdir(parents=True, exist_ok=True)
                 with target.open("wb") as f:
                     f.write(z.read(m))
+                extracted += 1
             if on_event and (i % 50 == 0 or i == total_members):
-                await on_event({"type":"stage","stage":"seclists_extracting","done":i,"total":total_members})
-    try: tmp_zip.unlink()
-    except Exception: pass
-    if on_event: await on_event({"type":"stage","stage":"seclists_ready"})
+                await on_event({"type":"stage","stage":"seclists_extracting","done": i, "total": total_members})
+    try:
+        tmp_zip.unlink()
+    except Exception:
+        pass
+
+    count = _txt_count()
+    log.info("SecLists extraction finished: %s text files", count)
+    if on_event: await on_event({"type":"stage","stage":"seclists_ready","files": count})
+
+    if count == 0:
+        # Hard fail so the caller can fallback or show a clear error
+        raise RuntimeError("SecLists Web-Content extraction yielded 0 *.txt files")
 
 def index_wordlists() -> Dict[str, List[Path]]:
+    """Scan Web-Content subtree and index wordlists by category."""
     catalog: Dict[str, List[Path]] = {"base": [], "raft": [], "cms": [], "svn": []}
     if not WEB_CONTENT_DIR.exists():
         return catalog
@@ -78,10 +115,14 @@ def index_wordlists() -> Dict[str, List[Path]]:
                 catalog["cms"].append(p)
             elif "/svndigger/" in posix:
                 catalog["svn"].append(p)
-    for k in catalog: catalog[k].sort()
+    for k in catalog:
+        catalog[k].sort()
+    log.info("Indexed wordlists: base=%d raft=%d cms=%d svn=%d",
+             len(catalog["base"]), len(catalog["raft"]), len(catalog["cms"]), len(catalog["svn"]))
     return catalog
 
 def choose_wordlists(url: str, html: str, headers: Dict[str, str], catalog: Dict[str, List[Path]]) -> List[Tuple[str, Path]]:
+    """Heuristics to select lists based on headers/HTML hints."""
     hdr = {k.lower(): v.lower() for k, v in headers.items()}
     lower_html = (html or "").lower()
     picks: List[Tuple[str, Path]] = []
@@ -90,24 +131,35 @@ def choose_wordlists(url: str, html: str, headers: Dict[str, str], catalog: Dict
         for p in group[:limit]:
             picks.append((label, p))
 
-    is_api = "application/json" in hdr.get("content-type","") or "swagger" in lower_html or "openapi" in lower_html
+    is_api = ("application/json" in hdr.get("content-type","") or "swagger" in lower_html or "openapi" in lower_html)
     is_wp = "wp-content" in lower_html or "wp-includes" in lower_html
     is_drupal = "drupal.settings" in lower_html or "sites/all/modules" in lower_html
     is_joomla = "joomla" in lower_html
 
     add("base", catalog["base"], limit=2)
-    if catalog["raft"]: add("raft", catalog["raft"], limit=1)
-    if is_wp or is_drupal or is_joomla: add("cms", catalog["cms"], limit=3)
-    if is_api: picks = [p for p in picks if p[0] == "base"][:1] + picks
+    if catalog["raft"]:
+        add("raft", catalog["raft"], limit=1)
+    if is_wp or is_drupal or is_joomla:
+        add("cms", catalog["cms"], limit=3)
+    if is_api:
+        picks = [p for p in picks if p[0] == "base"][:1] + picks
 
-    seen = set(); final: List[Tuple[str, Path]] = []
+    # Deduplicate by path
+    seen = set()
+    final: List[Tuple[str, Path]] = []
     for label, path in picks:
-        if path not in seen: final.append((label, path)); seen.add(path)
+        if path not in seen:
+            final.append((label, path)); seen.add(path)
+    log.info("Chosen wordlists: %d (%s)", len(final), ", ".join(p.name for _, p in final))
     return final
 
 def iter_candidates(paths: List[Tuple[str, Path]], cap: int) -> List[str]:
+    """
+    Read lines from chosen wordlists and build a unique, normalized list of paths.
+    GUARANTEES: returns List[str] (never bytes), leading '/' enforced.
+    """
     yielded = 0
-    dedupe: set[str] = set()
+    dedupe = set()
     for _, p in paths:
         try:
             with p.open("r", encoding="utf-8", errors="ignore") as f:
@@ -123,4 +175,13 @@ def iter_candidates(paths: List[Tuple[str, Path]], cap: int) -> List[str]:
                         dedupe.add(s); yielded += 1
         except Exception:
             continue
+    log.info("Built %d unique candidates (cap=%d)", len(dedupe), cap)
     return list(dedupe)
+
+def builtin_candidates(cap: int) -> List[str]:
+    out = []
+    for s in BUILTIN_CANDIDATES:
+        out.append(s if s.startswith("/") else "/" + s)
+        if len(out) >= cap: break
+    log.info("Using builtin fallback candidates: %d", len(out))
+    return out
