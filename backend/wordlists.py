@@ -1,6 +1,6 @@
 import asyncio, zipfile, io, os
 from pathlib import Path
-from typing import Dict, List, Tuple
+from typing import Dict, List, Tuple, Optional, Callable, Any
 import aiohttp
 
 SECLISTS_COMMIT = "617ecd9393ecd12925bde2467201c51e6baa7cdb"
@@ -16,32 +16,60 @@ WANTED_PATTERNS = [
     "SVNDigger/cat/*/*.txt",
 ]
 
-async def _download(url: str) -> bytes:
-    timeout = aiohttp.ClientTimeout(total=600)
-    async with aiohttp.ClientSession(timeout=timeout) as session:
-        async with session.get(url) as resp:
-            resp.raise_for_status()
-            return await resp.read()
+EventCb = Callable[[Dict[str, Any]], None]
 
-async def ensure_seclists():
+async def ensure_seclists(on_event: Optional[EventCb] = None):
+    """
+    Ensure Web-Content subtree exists. On first run, download the repo zip,
+    stream progress, and extract only what we need.
+    """
     if WEB_CONTENT_DIR.exists():
+        if on_event: await on_event({"type":"stage","stage":"seclists_cached"})
         return
-    os.makedirs(WEB_CONTENT_DIR, exist_ok=True)
+
+    SECLISTS_DIR.mkdir(parents=True, exist_ok=True)
+    tmp_zip = DATA / "seclists.repo.zip.part"
     zip_url = f"https://codeload.github.com/danielmiessler/SecLists/zip/{SECLISTS_COMMIT}"
-    blob = await _download(zip_url)
-    with zipfile.ZipFile(io.BytesIO(blob)) as z:
+
+    timeout = aiohttp.ClientTimeout(total=1800)
+    async with aiohttp.ClientSession(timeout=timeout) as session:
+        if on_event: await on_event({"type":"stage","stage":"seclists_download_start"})
+        async with session.get(zip_url) as resp:
+            resp.raise_for_status()
+            total = int(resp.headers.get("Content-Length") or 0)
+            downloaded = 0
+            with tmp_zip.open("wb") as f:
+                async for chunk in resp.content.iter_chunked(1<<20):
+                    f.write(chunk)
+                    downloaded += len(chunk)
+                    if on_event and total:
+                        await on_event({
+                            "type":"stage","stage":"seclists_downloading",
+                            "downloaded": downloaded, "total": total
+                        })
+
+    if on_event: await on_event({"type":"stage","stage":"seclists_extract_start"})
+    with zipfile.ZipFile(tmp_zip, "r") as z:
         prefix = f"SecLists-{SECLISTS_COMMIT}/Discovery/Web-Content/"
-        for member in z.infolist():
-            if not member.filename.startswith(prefix):
-                continue
-            rel = member.filename[len(f"SecLists-{SECLISTS_COMMIT}/"):]
+        members = [m for m in z.infolist() if m.filename.startswith(prefix)]
+        total_members = len(members) or 1
+        for i, m in enumerate(members, 1):
+            rel = m.filename[len(f"SecLists-{SECLISTS_COMMIT}/"):]
             target = SECLISTS_DIR / rel
-            if member.is_dir():
+            if m.is_dir():
                 target.mkdir(parents=True, exist_ok=True)
             else:
                 target.parent.mkdir(parents=True, exist_ok=True)
                 with target.open("wb") as f:
-                    f.write(z.read(member))
+                    f.write(z.read(m))
+            if on_event and (i % 50 == 0 or i == total_members):
+                await on_event({
+                    "type":"stage","stage":"seclists_extracting",
+                    "done": i, "total": total_members
+                })
+    try: tmp_zip.unlink()
+    except Exception: pass
+    if on_event: await on_event({"type":"stage","stage":"seclists_ready"})
 
 def index_wordlists() -> Dict[str, List[Path]]:
     catalog: Dict[str, List[Path]] = {"base": [], "raft": [], "cms": [], "svn": []}
@@ -58,10 +86,7 @@ def index_wordlists() -> Dict[str, List[Path]]:
                 catalog["cms"].append(p)
             elif "/svndigger/" in p.as_posix().lower():
                 catalog["svn"].append(p)
-    catalog["base"].sort()
-    catalog["raft"].sort()
-    catalog["cms"].sort()
-    catalog["svn"].sort()
+    for k in catalog: catalog[k].sort()
     return catalog
 
 def choose_wordlists(url: str, html: str, headers: Dict[str, str], catalog: Dict[str, List[Path]]) -> List[Tuple[str, Path]]:
@@ -80,25 +105,18 @@ def choose_wordlists(url: str, html: str, headers: Dict[str, str], catalog: Dict
     is_iis = "microsoft-iis" in hdr.get("server","") or "asp.net" in hdr.get("x-powered-by","")
 
     add("base", catalog["base"], limit=2)
-    if catalog["raft"]:
-        add("raft", catalog["raft"], limit=1)
-
-    if is_wp or is_drupal or is_joomla:
-        add("cms", catalog["cms"], limit=3)
-
-    if is_api:
-        picks = [p for p in picks if p[0] == "base"][:1] + picks
+    if catalog["raft"]: add("raft", catalog["raft"], limit=1)
+    if is_wp or is_drupal or is_joomla: add("cms", catalog["cms"], limit=3)
+    if is_api: picks = [p for p in picks if p[0] == "base"][:1] + picks
 
     # dedupe
-    seen = set()
-    final = []
+    seen = set(); final = []
     for label, path in picks:
         if path not in seen:
-            final.append((label, path))
-            seen.add(path)
+            final.append((label, path)); seen.add(path)
     return final
 
-def iter_candidates(paths: List[Path], cap: int) -> List[str]:
+def iter_candidates(paths: List[Tuple[str, Path]], cap: int) -> List[str]:
     yielded = 0
     dedupe = set()
     for _, p in paths:
@@ -108,11 +126,9 @@ def iter_candidates(paths: List[Path], cap: int) -> List[str]:
                     if yielded >= cap: return list(dedupe)
                     s = line.strip()
                     if not s or s.startswith("#"): continue
-                    if not s.startswith("/"):
-                        s = "/" + s
+                    if not s.startswith("/"): s = "/" + s
                     if s not in dedupe:
-                        dedupe.add(s)
-                        yielded += 1
+                        dedupe.add(s); yielded += 1
         except Exception:
             continue
     return list(dedupe)
