@@ -119,6 +119,13 @@ async function enumerate(){
       } else if (s === 'indexing_lists') {
         meta.textContent = 'Indexing wordlists…';
         setProgress(0.72);
+      } else if (s === 'indexing_lists_done') {
+        const c = msg.counts || {};
+        meta.textContent = `Indexed wordlists (base:${c.base||0} raft:${c.raft||0} cms:${c.cms||0} svn:${c.svn||0})`;
+        setProgress(0.74);
+      } else if (s === 'candidates_ready') {
+        meta.textContent = `Candidates ready: ${msg.count}`;
+        setProgress(0.81);
       } else if (s === 'probing_target') {
         meta.textContent = 'Probing target…';
         setProgress(0.75);
