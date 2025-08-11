@@ -59,46 +59,70 @@ async def start_enumeration(req: EnumerateRequest):
     async def emit(ev): await q.put(ev)
 
     async def run():
-        # SecLists (streamed progress)
-        await ensure_seclists(on_event=emit)
-        await emit({"type":"stage","stage":"indexing_lists"})
-        catalog = index_wordlists()
+        try:
+            # 1) SecLists (with streamed progress)
+            await ensure_seclists(on_event=emit)
 
-        enumerator = DirEnumerator(
-            req.url, follow_redirects=req.follow_redirects,
-            max_concurrency=req.max_concurrency, timeout=req.timeout_seconds
-        )
+            await emit({"type":"stage","stage":"indexing_lists"})
+            # 2) Index wordlists off the event loop
+            catalog = await asyncio.to_thread(index_wordlists)
+            counts = {k: len(v) for k, v in catalog.items()}
+            await emit({"type":"stage","stage":"indexing_lists_done","counts": counts})
 
-        await emit({"type":"stage","stage":"probing_target"})
-        import aiohttp
-        async with aiohttp.ClientSession() as session:
-            html, headers = await initial_probe(session, req.url)
+            # 3) Probe target
+            await emit({"type":"stage","stage":"probing_target"})
+            import aiohttp
+            async with aiohttp.ClientSession() as session:
+                html, headers = await initial_probe(session, req.url)
 
-            await emit({"type":"stage","stage":"choosing_wordlists"})
-            chosen = choose_wordlists(req.url, html, headers, catalog)
+                await emit({"type":"stage","stage":"choosing_wordlists"})
+                chosen = choose_wordlists(req.url, html, headers, catalog)
 
-            await emit({"type":"stage","stage":"building_candidates"})
-            candidates = iter_candidates(chosen, req.max_paths)
+                await emit({"type":"stage","stage":"building_candidates"})
+                # Build candidates off the loop too
+                candidates = await asyncio.to_thread(iter_candidates, chosen, req.max_paths)
+                await emit({"type":"stage","stage":"candidates_ready","count": len(candidates)})
 
-            hdr_low = {k.lower(): v.lower() for k,v in headers.items()}
-            exts = []
-            if "microsoft-iis" in hdr_low.get("server","") or "asp.net" in hdr_low.get("x-powered-by",""):
-                exts = [".aspx", ".asp"]
-            elif "php" in hdr_low.get("x-powered-by","") or "php" in (html or "").lower():
-                exts = [".php"]
+                hdr_low = {k.lower(): v.lower() for k, v in headers.items()}
+                exts = []
+                if "microsoft-iis" in hdr_low.get("server","") or "asp.net" in hdr_low.get("x-powered-by",""):
+                    exts = [".aspx", ".asp"]
+                elif "php" in hdr_low.get("x-powered-by","") or "php" in (html or "").lower():
+                    exts = [".php"]
 
-            await emit({"type":"meta","wordlists":[str(p) for _,p in chosen], "total_candidates": len(candidates), "exts": exts})
-            await emit({"type":"stage","stage":"soft_404_baseline"})
-            baseline = await soft_404_baseline(session, req.url)
+                await emit({"type":"meta","wordlists":[str(p) for _, p in chosen],
+                            "total_candidates": len(candidates), "exts": exts})
 
-        enumerator.exts_hint = exts
-        await emit({"type":"stage","stage":"enumeration_started"})
-        found_items = await enumerator.run(candidates, emit, baseline)
+                await emit({"type":"stage","stage":"soft_404_baseline"})
+                baseline = await soft_404_baseline(session, req.url)
 
-        filtered = [f.model_dump() for f in found_items if f.status in (200, 204, 301, 302, 401, 403)]
-        graph = _to_graph(req.url, filtered)
-        await emit({"type":"done","result": graph})
-        await q.put(None)
+            # 4) Enumerate
+            enumerator = DirEnumerator(
+                req.url,
+                follow_redirects=req.follow_redirects,
+                max_concurrency=req.max_concurrency,
+                timeout=req.timeout_seconds
+            )
+            enumerator.exts_hint = exts
+            await emit({"type":"stage","stage":"enumeration_started"})
+            found_items = await enumerator.run(candidates, emit, baseline)
+
+            filtered = [f.model_dump() for f in found_items if f.status in (200, 204, 301, 302, 401, 403)]
+            graph = _to_graph(req.url, filtered)
+            await emit({"type":"done","result": graph})
+
+        except asyncio.CancelledError:
+            # Canceled by client
+            try:
+                await emit({"type":"canceled"})
+            finally:
+                pass
+        except Exception as e:
+            # Any failure gets reported to the client instead of silently stalling
+            await emit({"type":"error","message": f"{e.__class__.__name__}: {e}"})
+        finally:
+            # Always close out the queue so the WS can finish cleanly
+            await q.put(None)
 
     JOBS[job_id]["task"] = asyncio.create_task(run())
     return {"job_id": job_id}
