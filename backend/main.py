@@ -1,4 +1,4 @@
-import asyncio, uuid
+import asyncio, uuid, traceback
 from pathlib import Path
 from typing import Dict, List
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException
@@ -23,16 +23,16 @@ async def index():
 JOBS: Dict[str, Dict] = {}
 
 def _to_graph(base_url: str, items: List[dict]):
-    nodes = [{"data":{"id":"root","label":base_url, "status":200}}]
+    nodes = [{"data":{"id":"root","label":str(base_url), "status":200}}]
     edges = []
     seen = {"root"}
     def node_id_for(path: str) -> str:
-        return ("root" if path in ("", "/") else path.rstrip("/")) or "root"
+        return ("root" if path in ("", "/") else str(path).rstrip("/")) or "root"
     for it in items:
-        path = it["path"]; np = node_id_for(path)
+        path = str(it["path"]); np = node_id_for(path)
         if np not in seen:
             issues_str = "; ".join(str(x) for x in (it.get("issues") or []))
-            nodes.append({"data":{"id": np, "label": path, "status": it["status"], "url": it["url"], "issues": issues_str}})
+            nodes.append({"data":{"id": np, "label": path, "status": int(it["status"]), "url": str(it["url"]), "issues": issues_str}})
             seen.add(np)
         parent = "root"
         if path and path != "/":
@@ -45,9 +45,9 @@ def _to_graph(base_url: str, items: List[dict]):
         edges.append({"data":{"id": f"{parent}->{np}", "source": parent, "target": np}})
     summary = {
         "total_tested": len(items),
-        "ok_200": sum(1 for i in items if i["status"]==200),
-        "forbidden_403": sum(1 for i in items if i["status"]==403),
-        "auth_401": sum(1 for i in items if i["status"]==401),
+        "ok_200": sum(1 for i in items if int(i["status"])==200),
+        "forbidden_403": sum(1 for i in items if int(i["status"])==403),
+        "auth_401": sum(1 for i in items if int(i["status"])==401),
         "redirects_30x": sum(1 for i in items if str(i["status"]).startswith("30")),
     }
     return {"nodes":nodes, "edges":edges, "summary":summary, "findings":items}
@@ -72,10 +72,10 @@ async def start_enumeration(req: EnumerateRequest):
             await emit({"type":"stage","stage":"probing_target"})
             import aiohttp
             async with aiohttp.ClientSession() as session:
-                html, headers = await initial_probe(session, req.url)
+                html, headers = await initial_probe(session, str(req.url))
 
                 await emit({"type":"stage","stage":"choosing_wordlists"})
-                chosen = choose_wordlists(req.url, html, headers, catalog)
+                chosen = choose_wordlists(str(req.url), html, headers, catalog)
 
                 await emit({"type":"stage","stage":"building_candidates"})
                 candidates = await asyncio.to_thread(iter_candidates, chosen, req.max_paths)
@@ -90,23 +90,24 @@ async def start_enumeration(req: EnumerateRequest):
 
                 await emit({"type":"meta","wordlists":[str(p) for _,p in chosen], "total_candidates": len(candidates), "exts": exts})
                 await emit({"type":"stage","stage":"soft_404_baseline"})
-                baseline = await soft_404_baseline(session, req.url)
+                baseline = await soft_404_baseline(session, str(req.url))
 
-            enumerator = DirEnumerator(req.url, follow_redirects=req.follow_redirects,
+            enumerator = DirEnumerator(str(req.url), follow_redirects=req.follow_redirects,
                                        max_concurrency=req.max_concurrency, timeout=req.timeout_seconds)
             enumerator.exts_hint = exts
             await emit({"type":"stage","stage":"enumeration_started"})
             found_items = await enumerator.run(candidates, emit, baseline)
 
-            filtered = [f.model_dump() for f in found_items if f.status in (200, 204, 301, 302, 401, 403)]
-            graph = _to_graph(req.url, filtered)
+            filtered = [f.model_dump() for f in found_items if int(f.status) in (200, 204, 301, 302, 401, 403)]
+            graph = _to_graph(str(req.url), filtered)
             await emit({"type":"done","result": graph})
 
         except asyncio.CancelledError:
             try: await emit({"type":"canceled"})
             finally: pass
-        except Exception as e:
-            await emit({"type":"error","message": f"{e.__class__.__name__}: {e}"})
+        except Exception:
+            # Emit full traceback to the client for visibility
+            await emit({"type":"error","message": traceback.format_exc()})
         finally:
             await q.put(None)
 
